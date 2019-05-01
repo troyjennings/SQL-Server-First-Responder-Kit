@@ -154,7 +154,7 @@ CREATE TABLE ##BlitzCacheProcs (
         unparameterized_query BIT,
         near_parallel BIT,
         plan_warnings BIT,
-        plan_multiple_plans BIT,
+        plan_multiple_plans INT,
         long_running BIT,
         downlevel_estimator BIT,
         implicit_conversions BIT,
@@ -271,7 +271,7 @@ BEGIN
 SET NOCOUNT ON;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
-SELECT @Version = '7.4', @VersionDate = '20190320';
+SELECT @Version = '7.5', @VersionDate = '20190427';
 
 
 IF(@VersionCheckMode = 1)
@@ -911,7 +911,7 @@ BEGIN
         unparameterized_query BIT,
         near_parallel BIT,
         plan_warnings BIT,
-        plan_multiple_plans BIT,
+        plan_multiple_plans INT,
         long_running BIT,
         downlevel_estimator BIT,
         implicit_conversions BIT,
@@ -1075,6 +1075,25 @@ IF @SkipAnalysis = 1
   RAISERROR(N'Skip Analysis set to 1, hiding Summary', 0, 1) WITH NOWAIT;
   SET @HideSummary = 1;
   END; 
+
+DECLARE @AllSortSql NVARCHAR(MAX) = N'';
+DECLARE @VersionShowsMemoryGrants BIT;
+IF EXISTS(SELECT * FROM sys.all_columns WHERE OBJECT_ID = OBJECT_ID('sys.dm_exec_query_stats') AND name = 'max_grant_kb')
+    SET @VersionShowsMemoryGrants = 1;
+ELSE
+    SET @VersionShowsMemoryGrants = 0;
+
+DECLARE @VersionShowsSpills BIT;
+IF EXISTS(SELECT * FROM sys.all_columns WHERE OBJECT_ID = OBJECT_ID('sys.dm_exec_query_stats') AND name = 'max_spills')
+    SET @VersionShowsSpills = 1;
+ELSE
+    SET @VersionShowsSpills = 0;
+
+DECLARE @VersionShowsAirQuoteActualPlans BIT;
+IF EXISTS(SELECT * FROM sys.all_columns WHERE OBJECT_ID = OBJECT_ID('sys.dm_exec_query_plan_stats') AND name = 'query_plan')
+    SET @VersionShowsAirQuoteActualPlans = 1;
+ELSE
+    SET @VersionShowsAirQuoteActualPlans = 0;
 
 IF @Reanalyze = 1 AND OBJECT_ID('tempdb..##BlitzCacheResults') IS NULL
   BEGIN
@@ -1732,24 +1751,15 @@ SELECT @v = common_version ,
 FROM   #checkversion
 OPTION (RECOMPILE);
 
-IF (@SortOrder IN ('memory grant', 'avg memory grant')) 
-  AND NOT EXISTS(SELECT * FROM sys.all_columns WHERE OBJECT_ID = OBJECT_ID('sys.dm_exec_query_stats') AND name = 'max_grant_kb')
+IF (@SortOrder IN ('memory grant', 'avg memory grant')) AND @VersionShowsMemoryGrants = 0
 BEGIN
    RAISERROR('Your version of SQL does not support sorting by memory grant or average memory grant. Please use another sort order.', 16, 1);
    RETURN;
 END;
 
-IF (@SortOrder IN ('spills') 
-  AND NOT EXISTS(SELECT * FROM sys.all_columns WHERE OBJECT_ID = OBJECT_ID('sys.dm_exec_query_stats') AND name = 'max_spills'))
+IF (@SortOrder IN ('spills', 'avg spills') AND @VersionShowsSpills = 0)
 BEGIN
-   RAISERROR('Your version of SQL does not support sorting by total spills. Please use another sort order.', 16, 1);
-   RETURN;
-END;
-
-IF (@SortOrder IN ('avg spills')
-  AND NOT EXISTS(SELECT * FROM sys.all_columns WHERE OBJECT_ID = OBJECT_ID('sys.dm_exec_query_stats') AND name = 'total_spills'))
-BEGIN
-   RAISERROR('Your version of SQL does not support sorting by average spills. Please use another sort order.', 16, 1);
+   RAISERROR('Your version of SQL does not support sorting by spills. Please use another sort order.', 16, 1);
    RETURN;
 END;
 
@@ -1783,6 +1793,12 @@ FROM   (SELECT TOP (@Top) x.*, xpa.*,
         FROM   sys.#view# x
                CROSS APPLY (SELECT * FROM sys.dm_exec_plan_attributes(x.plan_handle) AS ixpa 
                             WHERE ixpa.attribute = ''dbid'') AS xpa ' + @nl ;
+
+
+IF @VersionShowsAirQuoteActualPlans = 1
+    BEGIN
+    SET @body += N'     CROSS APPLY sys.dm_exec_query_plan_stats(x.plan_handle) AS deqps ' + @nl ;
+    END
 
 SET @body += N'        WHERE  1 = 1 ' +  @nl ;
 
@@ -1900,6 +1916,11 @@ SET @body += N') AS qs
        CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
        CROSS APPLY sys.dm_exec_query_plan(qs.plan_handle) AS qp ' + @nl ;
 
+IF @VersionShowsAirQuoteActualPlans = 1
+    BEGIN
+    SET @body += N'     CROSS APPLY sys.dm_exec_query_plan_stats(qs.plan_handle) AS deqps ' + @nl ;
+    END
+
 SET @body_where += N'       AND pa.attribute = ' + QUOTENAME('dbid', @q ) + @nl ;
 
 
@@ -1968,7 +1989,7 @@ SELECT TOP (@Top)
 	   NULL AS PercentMemoryGrantUsed, 
 	   NULL AS AvgMaxMemoryGrant,';
 
-		IF @v >=15 OR (@v = 14 AND @build >= 3015) OR (@v = 13 AND @build >= 5026)
+    IF @VersionShowsSpills = 1
     BEGIN
         RAISERROR(N'Getting spill information for newer versions of SQL', 0, 1) WITH NOWAIT;
 		SET @plans_triggers_select_list += N'
@@ -1987,10 +2008,20 @@ SELECT TOP (@Top)
 		   NULL AS AvgSpills, ' ;
     END;		       
 	     
-		SET @plans_triggers_select_list +=  
-	 N'st.text AS QueryText ,
-       query_plan AS QueryPlan,
-       t.t_TotalWorker,
+	SET @plans_triggers_select_list +=  
+	 N'st.text AS QueryText ,';
+
+    IF @VersionShowsAirQuoteActualPlans = 1
+        BEGIN
+        SET @plans_triggers_select_list += N' COALESCE(deqps.query_plan, qp.query_plan) AS QueryPlan, ' + @nl ;
+        END;
+    ELSE   
+        BEGIN
+        SET @plans_triggers_select_list += N' qp.query_plan AS QueryPlan, ' + @nl ;
+        END;
+
+	SET @plans_triggers_select_list +=  
+    N't.t_TotalWorker,
        t.t_TotalElapsed,
        t.t_TotalReads,
        t.t_TotalExecs,
@@ -2077,8 +2108,7 @@ BEGIN
            NULL AS LastReturnedRows, ' ;
     END;
 
-    IF (@v = 11 AND @build >= 6020) OR (@v = 12 AND @build >= 5000) OR (@v = 13 AND @build >= 1601) OR (@v >= 14)
-
+    IF @VersionShowsMemoryGrants = 1
     BEGIN
         RAISERROR(N'Getting memory grant information for newer versions of SQL', 0, 1) WITH NOWAIT;
 		SET @sql += N'
@@ -2101,7 +2131,7 @@ BEGIN
 		   NULL AS AvgMaxMemoryGrant, ' ;
     END;
 
-		IF @v >=15 OR (@v = 14 AND @build >= 3015) OR (@v = 13 AND @build >= 5026)
+	IF @VersionShowsSpills = 1
     BEGIN
         RAISERROR(N'Getting spill information for newer versions of SQL', 0, 1) WITH NOWAIT;
 		SET @sql += N'
@@ -2124,8 +2154,19 @@ BEGIN
            SUBSTRING(st.text, ( qs.statement_start_offset / 2 ) + 1, ( ( CASE qs.statement_end_offset
                                                                             WHEN -1 THEN DATALENGTH(st.text)
                                                                             ELSE qs.statement_end_offset
-                                                                          END - qs.statement_start_offset ) / 2 ) + 1) AS QueryText ,
-           query_plan AS QueryPlan,
+                                                                          END - qs.statement_start_offset ) / 2 ) + 1) AS QueryText , ' + @nl ;
+
+
+    IF @VersionShowsAirQuoteActualPlans = 1
+        BEGIN
+        SET @sql += N'           COALESCE(deqps.query_plan, qp.query_plan) AS QueryPlan, ' + @nl ;
+        END
+    ELSE
+        BEGIN
+        SET @sql += N'           query_plan AS QueryPlan, ' + @nl ;
+        END
+
+    SET @sql += N'
            t.t_TotalWorker,
            t.t_TotalElapsed,
            t.t_TotalReads,
@@ -2285,6 +2326,9 @@ FROM    (SELECT  SqlHandle,
 WHERE x.rn = 1
 OPTION (RECOMPILE);
 
+/* 
+    This block was used to delete duplicate queries, but has been removed.
+    For more info: https://github.com/BrentOzarULTD/SQL-Server-First-Responder-Kit/issues/2026
 WITH d AS (
 SELECT  SPID,
         ROW_NUMBER() OVER (PARTITION BY SqlHandle, QueryHash ORDER BY #sortable# DESC) AS rn
@@ -2294,7 +2338,8 @@ WHERE SPID = @@SPID
 DELETE d
 WHERE d.rn > 1
 AND SPID = @@SPID
-OPTION (RECOMPILE);
+OPTION (RECOMPILE); 
+*/
 ';
 
 SELECT @sort = CASE @SortOrder  WHEN N'cpu' THEN N'TotalCPU'
@@ -2399,11 +2444,11 @@ OPTION (RECOMPILE) ;
  * metric.
  */
 RAISERROR('Computing CPU, duration, read, and write metrics', 0, 1) WITH NOWAIT;
-DECLARE @total_duration MONEY,
-        @total_cpu MONEY,
-        @total_reads MONEY,
-        @total_writes MONEY,
-        @total_execution_count MONEY;
+DECLARE @total_duration BIGINT,
+        @total_cpu BIGINT,
+        @total_reads BIGINT,
+        @total_writes BIGINT,
+        @total_execution_count BIGINT;
 
 SELECT  @total_cpu = SUM(TotalCPU),
         @total_duration = SUM(TotalDuration),
@@ -2586,7 +2631,7 @@ RAISERROR(N'Gathering high level plan information', 0, 1) WITH NOWAIT;
 UPDATE  ##BlitzCacheProcs
 SET     NumberOfDistinctPlans = distinct_plan_count,
         NumberOfPlans = number_of_plans ,
-        plan_multiple_plans = CASE WHEN distinct_plan_count < number_of_plans THEN 1 END
+        plan_multiple_plans = CASE WHEN distinct_plan_count < number_of_plans THEN number_of_plans END
 FROM (
         SELECT  COUNT(DISTINCT QueryHash) AS distinct_plan_count,
                 COUNT(QueryHash) AS number_of_plans,
@@ -3396,7 +3441,7 @@ WITH XMLNAMESPACES('http://schemas.microsoft.com/sqlserver/2004/07/showplan' AS 
 UPDATE ##BlitzCacheProcs
 SET NumberOfDistinctPlans = distinct_plan_count,
     NumberOfPlans = number_of_plans,
-    plan_multiple_plans = CASE WHEN distinct_plan_count < number_of_plans THEN 1 END 
+    plan_multiple_plans = CASE WHEN distinct_plan_count < number_of_plans THEN number_of_plans END 
 FROM (
 SELECT COUNT(DISTINCT QueryHash) AS distinct_plan_count,
        COUNT(QueryHash) AS number_of_plans,
@@ -4327,7 +4372,7 @@ SET    Warnings = SUBSTRING(
                   CASE WHEN downlevel_estimator = 1 THEN ', Downlevel CE' ELSE '' END +
                   CASE WHEN implicit_conversions = 1 THEN ', Implicit Conversions' ELSE '' END +
                   CASE WHEN tvf_join = 1 THEN ', Function Join' ELSE '' END +
-                  CASE WHEN plan_multiple_plans = 1 THEN ', Multiple Plans' ELSE '' END +
+                  CASE WHEN plan_multiple_plans > 0 THEN ', Multiple Plans' + COALESCE(' (' + CAST(plan_multiple_plans AS VARCHAR(10)) + ')', '') ELSE '' END +
                   CASE WHEN is_trivial = 1 THEN ', Trivial Plans' ELSE '' END +
 				  CASE WHEN is_forced_serial = 1 THEN ', Forced Serialization' ELSE '' END +
 				  CASE WHEN is_key_lookup_expensive = 1 THEN ', Expensive Key Lookup' ELSE '' END +
@@ -4405,7 +4450,7 @@ SELECT  DISTINCT
                   CASE WHEN downlevel_estimator = 1 THEN ', Downlevel CE' ELSE '' END +
                   CASE WHEN implicit_conversions = 1 THEN ', Implicit Conversions' ELSE '' END +
                   CASE WHEN tvf_join = 1 THEN ', Function Join' ELSE '' END +
-                  CASE WHEN plan_multiple_plans = 1 THEN ', Multiple Plans' ELSE '' END +
+                  CASE WHEN plan_multiple_plans > 0 THEN ', Multiple Plans' + COALESCE(' (' + CAST(plan_multiple_plans AS VARCHAR(10)) + ')', '') ELSE '' END +
                   CASE WHEN is_trivial = 1 THEN ', Trivial Plans' ELSE '' END +
 				  CASE WHEN is_forced_serial = 1 THEN ', Forced Serialization' ELSE '' END +
 				  CASE WHEN is_key_lookup_expensive = 1 THEN ', Expensive Key Lookup' ELSE '' END +
@@ -4694,7 +4739,7 @@ BEGIN
                   CASE WHEN downlevel_estimator = 1 THEN '', 13'' ELSE '''' END +
                   CASE WHEN implicit_conversions = 1 THEN '', 14'' ELSE '''' END +
                   CASE WHEN tvf_join = 1 THEN '', 17'' ELSE '''' END +
-                  CASE WHEN plan_multiple_plans = 1 THEN '', 21'' ELSE '''' END +
+                  CASE WHEN plan_multiple_plans > 0 THEN '', 21'' ELSE '''' END +
                   CASE WHEN unmatched_index_count > 0 THEN '', 22'' ELSE '''' END + 
                   CASE WHEN is_trivial = 1 THEN '', 24'' ELSE '''' END + 
 				  CASE WHEN is_forced_serial = 1 THEN '', 25'' ELSE '''' END +
@@ -5140,7 +5185,7 @@ BEGIN
 
         IF EXISTS (SELECT 1/0
                    FROM   ##BlitzCacheProcs
-                   WHERE  plan_multiple_plans = 1
+                   WHERE  plan_multiple_plans > 0
 				   AND SPID = @@SPID)
         INSERT INTO ##BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
         VALUES (@@SPID,
@@ -6009,29 +6054,6 @@ IF OBJECT_ID('tempdb.. #bou_allsort') IS NULL
          );
    END;
 
-DECLARE @AllSortSql NVARCHAR(MAX) = N'';
-DECLARE @MemGrant BIT;
-SELECT  @MemGrant = CASE WHEN (
-                                ( @v < 11 )
-                                OR (
-                                     @v = 11
-                                     AND @build < 6020
-                                   )
-                                OR (
-                                     @v = 12
-                                     AND @build < 5000
-                                   )
-                                OR (
-                                     @v = 13
-                                     AND @build < 1601
-                                   )
-                              ) THEN 0
-                         ELSE 1
-                    END;
-
-DECLARE @Spills BIT;
-SELECT @Spills = CASE WHEN (@v >= 15 OR (@v = 14 AND @build >= 3015) OR (@v = 13 AND @build >= 5026)) THEN 1 ELSE 0 END;
-		 
 
 IF LOWER(@SortOrder) = 'all'
 BEGIN
@@ -6094,7 +6116,7 @@ SET @AllSortSql += N'
 					 
 					 '; 
 					
-					IF @MemGrant = 0
+					IF @VersionShowsMemoryGrants = 0
 					BEGIN
 						IF @ExportToExcel = 1
 						BEGIN
@@ -6113,7 +6135,7 @@ SET @AllSortSql += N'
 
 					END; 
 					
-					IF @MemGrant = 1
+					IF @VersionShowsMemoryGrants = 1
 					BEGIN 
 					SET @AllSortSql += N' SELECT TOP 1 @ISH = STUFF((SELECT DISTINCT N'','' + CONVERT(NVARCHAR(MAX),b2.SqlHandle, 1) FROM #bou_allsort AS b2 FOR XML PATH(N''''), TYPE).value(N''.[1]'', N''NVARCHAR(MAX)''), 1, 1, N'''') OPTION(RECOMPILE);
 					
@@ -6142,7 +6164,7 @@ SET @AllSortSql += N'
 
 				    END;
 
-					IF @Spills = 0
+					IF @VersionShowsSpills = 0
 					BEGIN
 						IF @ExportToExcel = 1
 						BEGIN
@@ -6161,7 +6183,7 @@ SET @AllSortSql += N'
 
 					END; 
 					
-					IF @Spills = 1
+					IF @VersionShowsSpills = 1
 					BEGIN 
 					SET @AllSortSql += N' SELECT TOP 1 @ISH = STUFF((SELECT DISTINCT N'','' + CONVERT(NVARCHAR(MAX),b2.SqlHandle, 1) FROM #bou_allsort AS b2 FOR XML PATH(N''''), TYPE).value(N''.[1]'', N''NVARCHAR(MAX)''), 1, 1, N'''') OPTION(RECOMPILE);
 					
@@ -6262,7 +6284,7 @@ SET @AllSortSql += N'
 					 
 					 ';
 					 
-					IF @MemGrant = 0
+					IF @VersionShowsMemoryGrants = 0
 					BEGIN
 						IF @ExportToExcel = 1
 						BEGIN
@@ -6281,7 +6303,7 @@ SET @AllSortSql += N'
 
 					END; 
 					
-					IF @MemGrant = 1
+					IF @VersionShowsMemoryGrants = 1
 					BEGIN 
 					SET @AllSortSql += N' SELECT TOP 1 @ISH = STUFF((SELECT DISTINCT N'','' + CONVERT(NVARCHAR(MAX),b2.SqlHandle, 1) FROM #bou_allsort AS b2 FOR XML PATH(N''''), TYPE).value(N''.[1]'', N''NVARCHAR(MAX)''), 1, 1, N'''') OPTION(RECOMPILE);
 					
@@ -6310,7 +6332,7 @@ SET @AllSortSql += N'
 
 				    END;
 
-					IF @Spills = 0
+					IF @VersionShowsSpills = 0
 					BEGIN
 						IF @ExportToExcel = 1
 						BEGIN
@@ -6329,7 +6351,7 @@ SET @AllSortSql += N'
 
 					END; 
 					
-					IF @Spills = 1
+					IF @VersionShowsSpills = 1
 					BEGIN 
 					SET @AllSortSql += N' SELECT TOP 1 @ISH = STUFF((SELECT DISTINCT N'','' + CONVERT(NVARCHAR(MAX),b2.SqlHandle, 1) FROM #bou_allsort AS b2 FOR XML PATH(N''''), TYPE).value(N''.[1]'', N''NVARCHAR(MAX)''), 1, 1, N'''') OPTION(RECOMPILE);
 					
